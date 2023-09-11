@@ -2,16 +2,29 @@
 
 from __future__ import unicode_literals, print_function
 
+import logging
 import re
 import json
 import sys
 import argparse
 import os
+import tempfile
 import time
 import typing
 import hashlib
+import uuid
+from tqdm import tqdm
 from datetime import date, datetime
+from pathlib import Path
+from random import random
+from zipfile import ZipFile
 
+from gitignore_parser import parse_gitignore
+from paramiko import ChannelFile, SSHClient, Channel
+from paramiko.ssh_exception import NoValidConnectionsError
+from scp import SCPClient, SCPException
+
+import paramiko
 import requests
 import getpass
 import subprocess
@@ -39,6 +52,9 @@ server_url_default = "https://console.vast.ai"
 api_key_file_base = "~/.vast_api_key"
 api_key_file = os.path.expanduser(api_key_file_base)
 api_key_guard = object()
+
+_app_path = '/app'
+
 
 class Object(object):
     pass
@@ -178,7 +194,8 @@ def translate_null_strings_to_blanks(d: typing.Dict) -> typing.Dict:
     return new_d
 
 
-def apiurl(args: argparse.Namespace, subpath: str, query_args: typing.Dict = None) -> str:
+def apiurl(args: argparse.Namespace, subpath: str, query_args: typing.Dict = None,
+           add_rnd: bool = False) -> str:
     """Creates the endpoint URL for a given combination of parameters.
 
     :param argparse.Namespace args: Namespace with many fields relevant to the endpoint.
@@ -190,6 +207,8 @@ def apiurl(args: argparse.Namespace, subpath: str, query_args: typing.Dict = Non
         query_args = {}
     if args.api_key is not None:
         query_args["api_key"] = args.api_key
+    if add_rnd:
+        query_args['.r'] = uuid.uuid4().hex
     if query_args:
         # a_list      = [<expression> for <l-expression> in <expression>]
         '''
@@ -475,13 +494,15 @@ def parse_query(query_str: str, res: typing.Dict = None) -> typing.Dict:
     return res
 
 
-def display_table(rows: list, fields: typing.Tuple) -> None:
+def display_table(rows: list, fields: typing.Tuple, max_count: typing.Optional[int] = None) -> None:
     """Basically takes a set of field names and rows containing the corresponding data and prints a nice tidy table
     of it.
 
     :param list rows: Each row is a dict with keys corresponding to the field names (first element) in the fields tuple.
 
     :param Tuple fields: 5-tuple describing a field. First element is field name, second is human readable version, third is format string, fourth is a lambda function run on the data in that field, fifth is a bool determining text justification. True = left justify, False = right justify. Here is an example showing the tuples in action.
+
+    :param int max_count: The maximum number of table entries to show.
 
     :rtype None:
 
@@ -490,6 +511,7 @@ def display_table(rows: list, fields: typing.Tuple) -> None:
     header = [name for _, name, _, _, _ in fields]
     out_rows = [header]
     lengths = [len(x) for x in header]
+    count = 0
     for instance in rows:
         row = []
         out_rows.append(row)
@@ -505,6 +527,9 @@ def display_table(rows: list, fields: typing.Tuple) -> None:
             idx = len(row)
             lengths[idx] = max(len(s), lengths[idx])
             row.append(s)
+        count += 1
+        if max_count is not None and count >= max_count:
+            break
     for row in out_rows:
         out = []
         for l, s, f in zip(lengths, row, fields):
@@ -556,7 +581,7 @@ def parse_vast_url(url_str):
     argument("dst", help="instance_id:/path to target of copy operation.", type=str),
     argument("-i", "--identity", help="Location of ssh private key", type=str),
     usage="./vast copy src dst",
-    help=" Copy directories between instances and/or local",
+    help=" Copy directories between instances and/or local, using rsync",
     epilog=deindent("""
         Copies a directory from a source location to a target location. Each of source and destination
         directories can be either local or remote, subject to appropriate read and write
@@ -598,7 +623,7 @@ def copy(args: argparse.Namespace):
     r = requests.put(url, json=req_json)
     r.raise_for_status()
     if (r.status_code == 200):
-        rj = r.json();
+        rj = r.json()
         #print(json.dumps(rj, indent=1, sort_keys=True))
         if (rj["success"]) and ((src_id is None) or (dst_id is None)):
             homedir = subprocess.getoutput("echo $HOME")
@@ -631,6 +656,108 @@ def copy(args: argparse.Namespace):
         print("failed with error {r.status_code}".format(**locals()));
 
 
+@parser.command(
+    argument("src", help="path to source directory to copy.", type=str),
+    argument("dst", help="instance_id:/path to target of copy operation.", type=str),
+    argument("-i", "--identity", help="Location of ssh private key", type=str),
+    argument("-g", "--gitignore", help="Do not copy files matching .gitignore paths", action="store_true"),
+    usage="./vast copy2 src dst",
+    help="Copy a directory from local to instance using Python-based scp",
+    epilog=deindent("""
+        Examples:
+         vast copy2 . 11824:/root
+    """),
+)
+def copy2(args: argparse.Namespace):
+    """
+    Transfer data from one instance to another.
+
+    @param src: Location of data object to be copied.
+    @param dst: Target to copy object to.
+    """
+
+    (src_id, src_path) = parse_vast_url(args.src)
+    (dst_id, dst_path) = parse_vast_url(args.dst)
+    if dst_id is None:
+        print('Error: destination path requires instance ID')
+        return 1
+    if src_id is not None:
+        print("Error: source path must be local")
+        return 1
+    if not os.path.isdir(src_path):
+        print('Error: source path must be a directory')
+        return 1
+    rel_paths = _relative_paths(src_path)
+    print(f'Copying {len(rel_paths)} files from {src_path} to {dst_path} in instance {dst_id}...')
+    check_gitignore = args.gitignore
+    instance = _get_instance(args, dst_id)
+    _scp_files(args, src_path, rel_paths, instance, dst_path, check_gitignore=check_gitignore)
+
+
+@parser.command(
+    argument("id", help="id of instance type (offer ID) to launch", type=int),
+    argument("command", help="command to be run in the launched instance", type=str),
+    argument("-i", "--identity", help="Location of ssh private key", type=str),
+    argument('--timeout', help="Maximum number of seconds to wait for instance to become available.", type=float,
+             default=512.0),
+    argument("--price", help="per machine bid price in $/hour", type=float),
+    argument("--disk", help="size of local disk partition in GB", type=float, default=10),
+    argument("--image", help="docker container image to launch", type=str),
+    argument("--login", help="docker login arguments for private repo authentication, surround with '' ", type=str),
+    argument("--label", help="label to set on the instance", type=str),
+    argument("--onstart", help="filename to use as onstart script", type=str),
+    argument("--onstart-cmd", help="contents of onstart script as single argument", type=str),
+    argument("--ssh",     help="Launch as an ssh instance type.", action="store_true"),
+    argument("--jupyter", help="Launch as a jupyter instance instead of an ssh instance.", action="store_true"),
+    argument("--direct",  help="Use (faster) direct connections for jupyter & ssh.", action="store_true"),
+    argument("--jupyter-dir", help="For runtype 'jupyter', directory in instance to use to launch jupyter. Defaults to image's working directory.", type=str),
+    argument("--jupyter-lab", help="For runtype 'jupyter', Launch instance with jupyter lab.", action="store_true"),
+    argument("--lang-utf8", help="Workaround for images with locale problems: install and generate locales before instance launch, and set locale to C.UTF-8.", action="store_true"),
+    argument("--python-utf8", help="Workaround for images with locale problems: set python's locale to C.UTF-8.", action="store_true"),
+    argument("--extra", help=argparse.SUPPRESS),
+    argument("--env",   help="env variables and port mapping options, surround with '' ", type=str),
+    argument("--args",  nargs=argparse.REMAINDER, help="list of arguments passed to container ENTRYPOINT. Onstart is recommended for this purpose."),
+    argument("--create-from", help="Existing instance id to use as basis for new instance. Instance configuration should usually be identical, as only the difference from the base image is copied.", type=str),
+    argument("--force", help="Skip sanity checks when creating from an existing instance", action="store_true"),
+    usage="./vast launch --image image-name id command",
+    help="Create instance, copy files, execute command, destroy instance.",
+    epilog=deindent("""
+        Examples:
+         vast launch --image pytorch/pytorch 123456 "python -u myexperiment.py"
+    """),
+)
+def launch(args: argparse.Namespace):
+    r = _create_instance(args)
+    r_props = r.json()
+    instance_id = r_props['new_contract']
+    print(f'Created instance {instance_id}.')
+    try:
+        _launch_job(args, instance_id)
+    finally:
+        args.id = instance_id
+        _destroy_instance(args)
+
+@parser.command(
+    argument("id", help="id of instance to launch", type=int),
+    argument("command", help="command to be run in the started instance", type=str),
+    argument('--timeout', help="Maximum number of seconds to wait for instance to become available.", type=float,
+             default=512.0),
+    usage="./vast start run id command",
+    help="Start an instance, install requirements, run command, and stop the instance.",
+    epilog=deindent("""
+        Examples:
+         vast start run 123456 "python -u myexperiment.py"
+    """),
+)
+def start__run(args: argparse.Namespace):
+    instance_id = args.id
+    _start_instance(args)
+    print(f'Started instance {instance_id}.')
+    try:
+        _launch_job(args, instance_id)
+    finally:
+        _stop_instance(args)
+
 
 @parser.command(
     argument("-t", "--type", default="on-demand", help="Show 'bid'(interruptible) or 'on-demand' offers. default: on-demand"),
@@ -641,6 +768,8 @@ def copy(args: argparse.Namespace):
     argument("--disable-bundling", action="store_true", help="Show identical offers. This request is more heavily rate limited."),
     argument("--storage", type=float, default=5.0, help="Amount of storage to use for pricing, in GiB. default=5.0GiB"),
     argument("-o", "--order", type=str, help="Comma-separated list of fields to sort on. postfix field with - to sort desc. ex: -o 'num_gpus,total_flops-'.  default='score-'", default='score-'),
+    argument("-f", "--fields", type=str, default=None, help="Comma-separated list of fields to show in the table."),
+    argument("-m", "--max", type=int, default=None, help="Maximum number of table entries to show."),
     argument("query", help="Query to search for. default: 'external=false rentable=true verified=true', pass -n to ignore default", nargs="*", default=None),
     usage="./vast search offers [--help] [--api-key API_KEY] [--raw] <query>",
     help="Search for instance types using custom query",
@@ -719,7 +848,7 @@ def search__offers(args):
         "dlperf_usd": "dlperf_per_dphtotal",
         "dph": "dph_total",
         "flops_usd": "flops_per_dphtotal",
-    };
+    }
 
     try:
 
@@ -734,13 +863,14 @@ def search__offers(args):
         order = []
         for name in args.order.split(","):
             name = name.strip()
-            if not name: continue
+            if not name:
+                continue
             direction = "asc"
             if name.strip("-") != name:
                 direction = "desc"
-            field = name.strip("-");
+            field = name.strip("-")
             if field in field_alias:
-                field = field_alias[field];
+                field = field_alias[field]
             order.append([field, direction])
 
         query["order"] = order
@@ -755,13 +885,20 @@ def search__offers(args):
         return 1
 
     url = apiurl(args, "/bundles", {"q": query})
-    r = requests.get(url);
+    r = requests.get(url)
     r.raise_for_status()
     rows = r.json()["offers"]
     if args.raw:
         print(json.dumps(rows, indent=1, sort_keys=True))
     else:
-        display_table(rows, displayable_fields)
+        shown_fields = displayable_fields
+        if args.fields is not None:
+            fields_set = set([f.strip() for f in args.fields.split(',')])
+            shown_fields = [f for f in displayable_fields if f[0] in fields_set]
+            if len(shown_fields) == 0:
+                print('Error: Fields requested not found.')
+                return 1
+        display_table(rows, shown_fields, max_count=args.max)
 
 
 @parser.command(
@@ -775,8 +912,8 @@ def show__instances(args):
     :param argparse.Namespace args: should supply all the command-line options
     :rtype:
     """
-    req_url = apiurl(args, "/instances", {"owner": "me"});
-    r = requests.get(req_url);
+    req_url = apiurl(args, "/instances", {"owner": "me"})
+    r = requests.get(req_url)
     r.raise_for_status()
     rows = r.json()["instances"]
     if args.raw:
@@ -814,8 +951,8 @@ def scp_url(args):
 
 
 def _ssh_url(args, protocol):
-    req_url = apiurl(args, "/instances", {"owner": "me"});
-    r = requests.get(req_url);
+    req_url = apiurl(args, "/instances", {"owner": "me"})
+    r = requests.get(req_url)
     r.raise_for_status()
     rows = r.json()["instances"]
     if args.id:
@@ -826,6 +963,266 @@ def _ssh_url(args, protocol):
     else:
         instance, = rows
     print(f'{protocol}root@{instance["ssh_host"]}:{instance["ssh_port"]}')
+
+
+def _ssh_url_for_id(args, protocol, id: int):
+    req_url = apiurl(args, "/instances", {"owner": "me"})
+    r = requests.get(req_url)
+    r.raise_for_status()
+    rows = r.json()["instances"]
+    instance, = [r for r in rows if r['id'] == id]
+    return f'{protocol}root@{instance["ssh_host"]}:{instance["ssh_port"]}'
+
+
+def _get_instance(args, target_id) -> typing.Any:
+    req_url = apiurl(args, "/instances", {"owner": "me"}, add_rnd=True)
+    r = requests.get(req_url)
+    r.raise_for_status()
+    rows = r.json()["instances"]
+    instances = [r for r in rows if r['id'] == target_id]
+    if len(instances) == 0:
+        raise ValueError(f'No instances with ID {target_id}')
+    return instances[0]
+
+
+def _is_instance_running(args, target_id):
+    instance = _get_instance(args, target_id)
+    return instance['actual_status'] == 'running'
+
+
+def _is_instance_obj_running(instance):
+    return instance['actual_status'] == 'running'
+
+
+def _wait_for_instance_running(args, target_id, timeout: float = 120):
+    print(f'Waiting for instance {target_id}...')
+    start_time = time.time()
+    pause_time = 45.0
+    while time.time() - start_time < timeout:
+        instance = _get_instance(args, target_id)
+        if _is_instance_obj_running(instance):
+            return instance
+        time.sleep(pause_time)
+    raise TimeoutError(f'Instance did not start in {time.time() - start_time:.1f} seconds')
+
+
+def _wait_for_connected_ssh_client(args, instance: any, timeout: float = 120):
+    start_time = time.time()
+    pause_time = 3.0
+    while time.time() - start_time < timeout:
+        try:
+            client = _get_connected_ssh_client(args, instance)
+            client.close()
+            return
+        except NoValidConnectionsError:
+            time.sleep(pause_time)
+    raise TimeoutError(f'Could not connect to instance in {time.time() - start_time:.1f} seconds')
+
+
+def _ssh_host_port(args, target_id: int):
+    instance = _get_instance(args, target_id)
+    ssh_host = instance['ssh_host']
+    ssh_port = instance['ssh_port']
+    return ssh_host, ssh_port,
+
+
+def _ssh_host_port_for_instance(instance: any):
+    ssh_host = instance['ssh_host']
+    ssh_port = instance['ssh_port']
+    return ssh_host, ssh_port,
+
+
+def _get_connected_ssh_client(args, instance: typing.Any):
+    ssh_host, ssh_port = _ssh_host_port_for_instance(instance)
+    ssh_client = paramiko.SSHClient()
+    ssh_client.load_system_host_keys()
+    ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    ssh_client.connect(hostname=ssh_host, username='root', port=ssh_port)
+    return ssh_client
+
+
+def _relative_paths(src_path: str):
+    file_paths = list(Path(src_path).rglob('*'))
+    return [str(p.relative_to(src_path)) for p in file_paths]
+
+
+def _scp_dowload(args, remote_path: str, local_path: str, instance: any, preserve_times: bool = True):
+    ssh_host, ssh_port = _ssh_host_port_for_instance(instance)
+    with paramiko.SSHClient() as ssh_client:
+        ssh_client.load_system_host_keys()
+        ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh_client.connect(hostname=ssh_host, username='root', port=ssh_port)
+        with SCPClient(ssh_client.get_transport()) as scp:
+            scp.get(remote_path, local_path, recursive=True, preserve_times=preserve_times)
+
+
+def _upload_zip(instance: typing.Any, src_zip_path: str, remote_path: str):
+    ssh_host, ssh_port = _ssh_host_port_for_instance(instance)
+    file_size = os.path.getsize(src_zip_path)
+    print(f'Uploading zip file of {file_size / 1e6:.4g} Mb...')
+    with paramiko.SSHClient() as ssh_client:
+        ssh_client.load_system_host_keys()
+        ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh_client.connect(hostname=ssh_host, username='root', port=ssh_port)
+        target_zip_path = '/tmp/vast-upload.zip'
+
+        with tqdm(total=file_size, unit='B', unit_scale=True, desc="Uploading") as progress:
+            def progress_fn(filename: bytes, size: int, sent: int, x):
+                progress.update(sent - progress.n)
+
+            try:
+                with SCPClient(ssh_client.get_transport(), progress4=progress_fn) as scp:
+                    scp.put([src_zip_path], target_zip_path)
+            except SCPException as scp_err:
+                print(f'Error: {scp_err}')
+                return 1
+        print('Installing zip package...')
+        _execute(ssh_client, 'apt-get install -y zip')
+        print('Unzipping uploaded files...')
+        _execute(ssh_client, f'unzip -o {target_zip_path} -d {remote_path}')
+
+
+def _scp_files(args, src_path: str, rel_src_paths: typing.List[str], instance: any, remote_path: str,
+               check_gitignore: bool):
+    gi_matches = None
+    if check_gitignore:
+        pattern_ignore_path = None
+        vast_ignore_path = os.path.join(src_path, '.vastignore')
+        if os.path.exists(vast_ignore_path):
+            pattern_ignore_path = vast_ignore_path
+        else:
+            git_ignore_path = os.path.join(src_path, '.gitignore')
+            if os.path.exists(git_ignore_path):
+                pattern_ignore_path = git_ignore_path
+        if pattern_ignore_path is not None:
+            gi_matches = parse_gitignore(pattern_ignore_path)
+    print('Building zip file...')
+    tmp_zip_file = tempfile.NamedTemporaryFile(prefix='vast-', suffix='.zip', delete=False)
+    try:
+        count = 0
+        with ZipFile(tmp_zip_file, 'w') as zip_object:
+            # Adding files that need to be zipped
+            for rel_path in rel_src_paths:
+                ignore = gi_matches is not None and gi_matches(rel_path)
+                if not ignore:
+                    src_file_path = os.path.join(src_path, rel_path)
+                    zip_object.write(src_file_path, arcname=rel_path)
+                    count += 1
+        print(f'Zipped {count} files. Excluded {len(rel_src_paths) - count}.')
+        _upload_zip(instance, tmp_zip_file.name, remote_path)
+    finally:
+        try:
+            os.remove(tmp_zip_file.name)
+        except:
+            # TODO ignoring issue
+            pass
+
+
+def _capture_channel_output(channel: Channel):
+    some_receive = False
+    second_attempt = False
+    while True:
+        time.sleep(0.001)
+        if channel.recv_ready():
+            solo_line = channel.recv(1024)
+            sys.stdout.buffer.write(solo_line)
+            sys.stdout.buffer.flush()
+            some_receive = True
+        elif channel.exit_status_ready():
+            if some_receive or second_attempt:
+                break
+            second_attempt = True
+            time.sleep(1.0)
+
+
+def _execute(ssh_client: SSHClient, command: str, get_pty=False):
+    stdout: ChannelFile
+    stdin, stdout, stderr = ssh_client.exec_command(command, get_pty=get_pty)
+    stdout.channel.set_combine_stderr(True)
+    _capture_channel_output(stdout.channel)
+
+
+def _send_command(c: Channel, text: str, verbose: bool = False):
+    if not text.endswith('\n'):
+        text = text + '\n'
+    text_b = bytes(text, encoding='utf-8')
+    while len(text_b) > 0:
+        n_sent = c.send(text_b)
+        if n_sent == 0:
+            logging.warning('Got EOF sending shell command.')
+            return
+        text_b = text_b[n_sent:]
+    if verbose:
+        print(f'Shell: {text.strip()}')
+        _capture_channel_output(c)
+
+
+def _wait_for_instance_ready_timeout(args, instance_id: int):
+    timeout = args.timeout
+    time1 = time.time()
+    instance = _wait_for_instance_running(args, instance_id, timeout=timeout)
+    time2 = time.time()
+    timeout -= (time2 - time1)
+    _wait_for_connected_ssh_client(args, instance, timeout=timeout)
+    return instance
+
+
+def _launch_job_in_ready_instance(args, instance):
+    src_path = '.'
+    rel_src_paths = _relative_paths(src_path)
+    has_reqs = 'requirements.txt' in rel_src_paths
+    remote_path = _app_path
+    _scp_files(args, src_path, rel_src_paths, instance, remote_path, check_gitignore=True)
+    with _get_connected_ssh_client(args, instance) as ssh_client:
+        path_script_file = '.vast-set-path.sh'
+        path_script = f'{remote_path}/{path_script_file}'
+        with ssh_client.invoke_shell() as shell:
+            _send_command(shell, f'rm -f {path_script} && touch {path_script}\n')
+            _send_command(shell, f'echo "export PYTHONUNBUFFERED=1" >> {path_script}\n')
+            _send_command(shell, f'echo "export PYTHONPATH={remote_path}" >> {path_script}\n')
+            _send_command(shell, f'echo "export PATH=\\"$PATH\\"" >> {path_script}\n')
+
+        def _full_command(cmd: str) -> str:
+            return f'cd {remote_path} && source {path_script_file} && {cmd}'
+
+        if has_reqs:
+            print('Installing requirements...')
+            _execute(ssh_client, _full_command('pip install -r requirements.txt'))
+        else:
+            print('No requirements.txt file found.')
+        print('===== command output follows =====')
+        _execute(ssh_client, _full_command(args.command))
+        print('===== end of command output ====')
+        artifacts_remote_path = (Path(remote_path) / 'vast-artifacts').as_posix()
+        try:
+            _scp_dowload(args, artifacts_remote_path, src_path, instance)
+            print('Artifacts downloaded.')
+        except SCPException:
+            print('No artifacts produced (or unable to download.)')
+
+
+def _launch_job(args, instance_id: int):
+    instance = _wait_for_instance_ready_timeout(args, instance_id)
+    return _launch_job_in_ready_instance(args, instance)
+
+
+def _start_instance(args):
+    instance_id = args.id
+    url = apiurl(args, "/instances/{id}/".format(id=instance_id))
+    r = requests.put(url, json={
+        "state": "running"
+    })
+    r.raise_for_status()
+    instance = _wait_for_instance_ready_timeout(args, instance_id)
+    return instance
+
+
+def _stop_instance(args):
+    url = apiurl(args, "/instances/{id}/".format(id=args.id))
+    r = requests.put(url, json={
+        "state": "stopped"
+    })
+    r.raise_for_status()
 
 
 @parser.command(
@@ -1347,10 +1744,7 @@ def destroy__instance(args):
 
     :param argparse.Namespace args: should supply all the command-line options
     """
-    url = apiurl(args, "/instances/{id}/".format(id=args.id))
-    r = requests.delete(url, json={})
-    r.raise_for_status()
-
+    r = _destroy_instance(args)
     if (r.status_code == 200):
         rj = r.json();
         if (rj["success"]):
@@ -1517,6 +1911,56 @@ def parse_env(envs):
 
 #print(parse_env("-e TYZ=BM3828 -e BOB=UTC -p 10831:22 -p 8080:8080"))
 
+def _create_instance(args):
+    if args.onstart:
+        with open(args.onstart, "r") as reader:
+            args.onstart_cmd = reader.read()
+    runtype = 'ssh'
+    if args.args:
+        runtype = 'args'
+    if args.jupyter_dir or args.jupyter_lab:
+        args.jupyter = True
+    if args.jupyter and runtype == 'args':
+        print("Error: Can't use --jupyter and --args together. Try --onstart or --onstart-cmd instead of --args.", file=sys.stderr)
+        return 1
+
+    if args.jupyter:
+        runtype = 'jupyter_direc ssh_direct ssh_proxy' if args.direct else 'jupyter_proxy ssh_proxy'
+
+    if args.ssh:
+        runtype = 'ssh_direct ssh_proxy' if args.direct else 'ssh_proxy'
+
+    url = apiurl(args, "/asks/{id}/".format(id=args.id))
+    r = requests.put(url, json={
+        "client_id": "me",
+        "image": args.image,
+        "args": args.args,
+        "env": parse_env(args.env),
+        "price": args.price,
+        "disk": args.disk,
+        "label": args.label,
+        "extra": args.extra,
+        "onstart": args.onstart_cmd,
+        "runtype": runtype,
+        "image_login": args.login,
+        "python_utf8": args.python_utf8,
+        "lang_utf8": args.lang_utf8,
+        "use_jupyter_lab": args.jupyter_lab,
+        "jupyter_dir": args.jupyter_dir,
+        "create_from": args.create_from,
+        "force": args.force
+    })
+    r.raise_for_status()
+    return r
+
+
+def _destroy_instance(args):
+    url = apiurl(args, "/instances/{id}/".format(id=args.id))
+    r = requests.delete(url, json={})
+    r.raise_for_status()
+    return r
+
+
 @parser.command(
     argument("id", help="id of instance type to launch", type=int),
     argument("--price", help="per machine bid price in $/hour", type=float),
@@ -1551,45 +1995,7 @@ def create__instance(args: argparse.Namespace):
 
     :param argparse.Namespace args: Namespace with many fields relevant to the endpoint.
     """
-    if args.onstart:
-        with open(args.onstart, "r") as reader:
-            args.onstart_cmd = reader.read()
-    runtype = 'ssh'
-    if args.args:
-        runtype = 'args'
-    if args.jupyter_dir or args.jupyter_lab:
-        args.jupyter = True
-    if args.jupyter and runtype == 'args':
-        print("Error: Can't use --jupyter and --args together. Try --onstart or --onstart-cmd instead of --args.", file=sys.stderr)
-        return 1
-
-    if args.jupyter:
-        runtype = 'jupyter_direc ssh_direct ssh_proxy' if args.direct else 'jupyter_proxy ssh_proxy'
-
-    if args.ssh:
-        runtype = 'ssh_direct ssh_proxy' if args.direct else 'ssh_proxy'
-
-    url = apiurl(args, "/asks/{id}/".format(id=args.id))
-    r = requests.put(url, json={
-        "client_id": "me",
-        "image": args.image,
-        "args": args.args,
-        "env" : parse_env(args.env),
-        "price": args.price,
-        "disk": args.disk,
-        "label": args.label,
-        "extra": args.extra,
-        "onstart": args.onstart_cmd,
-        "runtype": runtype,
-        "image_login": args.login,
-        "python_utf8": args.python_utf8,
-        "lang_utf8": args.lang_utf8,
-        "use_jupyter_lab": args.jupyter_lab,
-        "jupyter_dir": args.jupyter_dir,
-        "create_from": args.create_from,
-        "force": args.force
-    })
-    r.raise_for_status()
+    r = _create_instance(args)
     if args.raw:
         print(json.dumps(r.json(), indent=1))
     else:
